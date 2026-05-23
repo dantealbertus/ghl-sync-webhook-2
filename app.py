@@ -829,20 +829,102 @@ def setup_webhooks():
         log.error(f"setup_webhooks error: {e}")
 
 
-def _poll_loop():
-    setup_webhooks()
+# Contact type snapshot: { contact_id: type_string }
+_contact_type_snapshot: dict = {}
+CONTACT_POLL_INTERVAL = int(os.environ.get("CONTACT_POLL_INTERVAL_SECONDS", "120"))
+
+
+def _fetch_all_contacts_lightweight() -> list:
+    """Fetch all contacts (id + type + businessId only) for type-change detection."""
+    all_contacts = []
+    params = {"locationId": LOCATION_ID, "limit": 100}
     while True:
         try:
-            poll_company_changes()
+            r = _ghl_request(lambda p=dict(params): requests.get(
+                f"{BASE_URL}/contacts/", headers=pit_headers(), params=p, timeout=15
+            ))
+            if r.status_code != 200:
+                break
+            data     = r.json()
+            contacts = data.get("contacts", [])
+            if not contacts:
+                break
+            all_contacts.extend(contacts)
+            if len(contacts) < 100:
+                break
+            meta = data.get("meta", {})
+            start_after = meta.get("startAfter")
+            if not start_after:
+                break
+            params["startAfter"] = start_after
+            sa_id = meta.get("startAfterId") or meta.get("startAfterContact")
+            if sa_id:
+                params["startAfterId"] = sa_id
         except Exception as e:
-            log.error(f"Unhandled error in poll loop: {e}")
-        time.sleep(POLL_INTERVAL_SECS)
+            log.error(f"Error fetching contacts: {e}")
+            break
+    return all_contacts
+
+
+def poll_contact_type_changes():
+    """Detect contact type changes (GHL doesn't send webhooks for type changes)."""
+    try:
+        contacts = _fetch_all_contacts_lightweight()
+    except Exception as e:
+        log.error(f"Contact poll failed: {e}")
+        return
+
+    changed = 0
+    for c in contacts:
+        cid      = c["id"]
+        cur_type = (c.get("type") or "").strip().lower()
+
+        with _snapshot_lock:
+            prev_type = _contact_type_snapshot.get(cid)
+
+        if prev_type is None:
+            with _snapshot_lock:
+                _contact_type_snapshot[cid] = cur_type
+            continue
+
+        if cur_type != prev_type:
+            log.info(f"Contact type changed: {cid} {prev_type!r} → {cur_type!r}")
+            if not is_syncing(f"contact_{cid}"):
+                sync_contact_to_company(c)
+                changed += 1
+
+        with _snapshot_lock:
+            _contact_type_snapshot[cid] = cur_type
+
+    if changed:
+        log.info(f"Contact type poll: {changed} changes synced")
+
+
+def _poll_loop():
+    setup_webhooks()
+    company_tick = 0
+    contact_tick = 0
+    while True:
+        now = time.time()
+        if now - company_tick >= POLL_INTERVAL_SECS:
+            try:
+                poll_company_changes()
+            except Exception as e:
+                log.error(f"Company poll error: {e}")
+            company_tick = now
+        if now - contact_tick >= CONTACT_POLL_INTERVAL:
+            try:
+                poll_contact_type_changes()
+            except Exception as e:
+                log.error(f"Contact type poll error: {e}")
+            contact_tick = now
+        time.sleep(5)
 
 
 def start_poller():
     t = threading.Thread(target=_poll_loop, daemon=True, name="company-poller")
     t.start()
-    log.info(f"Company poller started (interval={POLL_INTERVAL_SECS}s)")
+    log.info(f"Poller started — company interval={POLL_INTERVAL_SECS}s, contact type interval={CONTACT_POLL_INTERVAL}s")
 
 
 # Start background poller when module is imported (works with gunicorn)
