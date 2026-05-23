@@ -4,15 +4,18 @@ GHL bidirectional sync: Contact ↔ Company
 Webhook server deployed on Railway.
 
 Syncs:
-  - Contact tag added/removed        → company_tag, company_tags, contact_type
-  - Contact type changed             → company contact_type
-  - Contact linked to company        → full sync to company
-  - Company contact_type changed     → all linked contacts
-  - Company company_tag changed      → all linked contacts
+  - Contact tag added/removed        → company_tags on linked company  (via GHL webhook)
+  - Contact type changed             → contact_type on linked company  (via GHL webhook)
+  - Contact linked to company        → full sync to company            (via GHL webhook)
+  - Company contact_type changed     → all linked contacts             (via background poll)
+  - Company company_tags changed     → all linked contacts             (via background poll)
+
+No GHL Workflows needed — company changes are detected via a background poller
+that runs every POLL_INTERVAL_SECONDS seconds.
 """
 
 from flask import Flask, request, jsonify
-import requests, json, re, os, time, logging
+import requests, json, re, os, time, logging, threading
 from rapidfuzz import fuzz, process
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,7 +32,12 @@ CLIENT_SECRET = os.environ["GHL_CLIENT_SECRET"]
 COMPANY_ID  = os.environ["GHL_COMPANY_ID"]   # agency companyId
 
 NUM_TAG_RE = re.compile(r'^(\d{2})-(\d{2})\s+')
-FUZZY_THRESHOLD = 75
+FUZZY_THRESHOLD    = 75
+POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # default 5 min
+
+# Snapshot of last known company states for change detection
+# { company_id: {"contact_type": "...", "company_tags": ["key1", ...]} }
+_company_snapshot: dict = {}
 
 CONTACT_TYPE_MAP = {
     "kanaalpartner":          "kanaalpartner",
@@ -411,9 +419,109 @@ def force_sync_company(company_id):
     return jsonify({"status": "ok"}), 200
 
 
+# ── Background company poller ─────────────────────────────────────────────────
+def _fetch_all_companies():
+    """Fetch all company records from GHL Objects API."""
+    all_records = []
+    page = 1
+    while True:
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/objects/business/records/search",
+                headers=oauth_headers(),
+                json={"locationId": LOCATION_ID, "page": page, "pageLimit": 100},
+                timeout=30
+            )
+            records = resp.json().get("records", [])
+            if not records:
+                break
+            all_records.extend(records)
+            if len(records) < 100:
+                break
+            page += 1
+        except Exception as e:
+            log.error(f"Error fetching companies page {page}: {e}")
+            break
+    return all_records
+
+
+def poll_company_changes():
+    """
+    Polls GHL for company changes and syncs to linked contacts when detected.
+    Runs in a background thread every POLL_INTERVAL_SECS seconds.
+    """
+    global _company_snapshot
+    log.info("Polling companies for changes...")
+
+    try:
+        companies = _fetch_all_companies()
+    except Exception as e:
+        log.error(f"Poll failed: {e}")
+        return
+
+    for comp in companies:
+        comp_id = comp["id"]
+        props   = comp.get("properties", {})
+
+        current_ct   = props.get("contact_type") or ""
+        current_tags = sorted(props.get("company_tags") or [])
+
+        prev = _company_snapshot.get(comp_id)
+
+        if prev is None:
+            # First run — just record state, don't sync (avoid mass updates on boot)
+            _company_snapshot[comp_id] = {"contact_type": current_ct, "company_tags": current_tags}
+            continue
+
+        prev_ct   = prev.get("contact_type", "")
+        prev_tags = prev.get("company_tags", [])
+
+        ct_changed   = current_ct != prev_ct
+        tags_added   = [t for t in current_tags if t not in prev_tags]
+        tags_removed = [t for t in prev_tags   if t not in current_tags]
+
+        if ct_changed or tags_added or tags_removed:
+            comp_name = props.get("name", comp_id)
+            log.info(
+                f"Company changed: '{comp_name}' | "
+                f"contact_type: {prev_ct!r} → {current_ct!r} | "
+                f"tags_added={tags_added} | tags_removed={tags_removed}"
+            )
+            sync_company_to_contacts(
+                comp_id,
+                contact_type=current_ct if ct_changed else None,
+                company_tags_added=tags_added   or None,
+                company_tags_removed=tags_removed or None,
+            )
+
+        # Update snapshot
+        _company_snapshot[comp_id] = {"contact_type": current_ct, "company_tags": current_tags}
+
+    log.info(f"Poll complete — {len(companies)} companies checked")
+
+
+def _poll_loop():
+    """Runs poll_company_changes on a fixed interval forever."""
+    while True:
+        try:
+            poll_company_changes()
+        except Exception as e:
+            log.error(f"Unhandled error in poll loop: {e}")
+        time.sleep(POLL_INTERVAL_SECS)
+
+
+def start_poller():
+    t = threading.Thread(target=_poll_loop, daemon=True, name="company-poller")
+    t.start()
+    log.info(f"Company poller started (interval={POLL_INTERVAL_SECS}s)")
+
+
+# Start background poller when module is imported (works with gunicorn)
+start_poller()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"Starting GHL sync server on port {port}")
-    get_oauth_token()   # warm up token on startup
-    get_field_options() # warm up field cache on startup
+    get_oauth_token()
+    get_field_options()
     app.run(host="0.0.0.0", port=port)
