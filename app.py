@@ -37,7 +37,8 @@ POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 WEBHOOK_BASE_URL   = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
 REDIRECT_URI       = os.environ.get("GHL_REDIRECT_URI",
                         f"{WEBHOOK_BASE_URL}/oauth/callback" if WEBHOOK_BASE_URL else "https://unbreakablesystems.nl/")
-GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write oauth.write oauth.readonly"
+GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write"
+GHL_APP_VERSION_ID = CLIENT_ID.split("-")[0]   # base ID without the key suffix
 WEBHOOK_NAME       = "GHL Contact Sync"
 WEBHOOK_EVENTS     = ["ContactCreate", "ContactUpdate", "ContactTagUpdate"]
 
@@ -501,13 +502,14 @@ def reauth():
 
 @app.route("/oauth/url", methods=["GET"])
 def oauth_url():
-    """Return the GHL authorization URL. Visit it in your browser, then POST the code to /oauth/exchange."""
+    """Return the GHL authorization URL. Visit it in your browser to authorize."""
     from urllib.parse import urlencode
-    url = "https://marketplace.gohighlevel.com/oauth/chooselocation?" + urlencode({
+    url = "https://marketplace.gohighlevel.com/v2/oauth/chooselocation?" + urlencode({
         "response_type": "code",
         "redirect_uri":  REDIRECT_URI,
         "client_id":     CLIENT_ID,
         "scope":         GHL_SCOPES,
+        "version_id":    GHL_APP_VERSION_ID,
     })
     return jsonify({"url": url, "redirect_uri": REDIRECT_URI}), 200
 
