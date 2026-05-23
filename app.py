@@ -339,7 +339,7 @@ def update_contact(contact_id: str, payload: dict):
 
 # ── Sync logic ────────────────────────────────────────────────────────────────
 def sync_contact_to_company(contact: dict):
-    """Contact.type → company.contact_type, contact.tags → company.company_tags (add)."""
+    """Contact.type → company.contact_type, contact.tags → company.company_tags (add+remove)."""
     company_id = contact.get("businessId")
     if not company_id:
         return
@@ -350,23 +350,47 @@ def sync_contact_to_company(contact: dict):
 
     mark_syncing(f"contact_{contact['id']}")
 
-    tags     = contact.get("tags", [])
-    raw_type = (contact.get("type") or "").strip()
-    ct_key   = resolve_contact_type(raw_type)
+    # Fetch ALL linked contacts and compute the full union of their tags.
+    # Use fresh webhook data for the triggering contact (most up-to-date).
+    linked = get_linked_contacts(company_id)
+    linked = [c for c in linked if c["id"] != contact["id"]] + [contact]
 
-    tag_keys_to_add = [k for k in (resolve_tag_key(t) for t in tags) if k]
-    unresolved = [t for t in tags if not resolve_tag_key(t)]
+    all_tag_labels: set = set()
+    for c in linked:
+        for tag in c.get("tags", []):
+            all_tag_labels.add(tag)
+
+    new_tag_keys = set(k for k in (resolve_tag_key(t) for t in all_tag_labels) if k)
+
+    unresolved = [t for t in all_tag_labels if not resolve_tag_key(t)]
     if unresolved:
         log.warning(f"Unresolved tags (not in dropdown): {unresolved}")
+
+    # Compare with current company snapshot to determine add/remove delta
+    with _snapshot_lock:
+        prev = _company_snapshot.get(company_id, {})
+    current_tag_keys = set(prev.get("company_tags", []))
+
+    tags_to_add    = list(new_tag_keys - current_tag_keys)
+    tags_to_remove = list(current_tag_keys - new_tag_keys)
+
+    raw_type = (contact.get("type") or "").strip()
+    ct_key   = resolve_contact_type(raw_type)
 
     props = {}
     if ct_key:
         props["contact_type"] = ct_key
-    if tag_keys_to_add:
-        props["company_tags"] = {"add": tag_keys_to_add}
+
+    tag_delta = {}
+    if tags_to_add:
+        tag_delta["add"] = tags_to_add
+    if tags_to_remove:
+        tag_delta["remove"] = tags_to_remove
+    if tag_delta:
+        props["company_tags"] = tag_delta
 
     if props:
-        log.info(f"Contact {contact['id']} → company {company_id}: contact_type={ct_key}, company_tags add={tag_keys_to_add}")
+        log.info(f"Contact {contact['id']} → company {company_id}: contact_type={ct_key}, tags_add={tags_to_add}, tags_remove={tags_to_remove}")
         update_company(company_id, props)
 
 
