@@ -54,10 +54,21 @@ CONTACT_TYPE_MAP = {
 }
 
 # ── OAuth token cache ─────────────────────────────────────────────────────────
+def _jwt_exp(token: str) -> float:
+    """Read exp claim from JWT payload without verifying signature."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.b64decode(payload)).get("exp", 0))
+    except Exception:
+        return 0.0
+
+_initial_token = os.environ.get("GHL_LOCATION_TOKEN", "")
 _token_cache = {
-    "access_token":  os.environ.get("GHL_LOCATION_TOKEN", ""),
+    "access_token":  _initial_token,
     "refresh_token": os.environ.get("GHL_REFRESH_TOKEN", ""),
-    "expires_at":    0,
+    "expires_at":    _jwt_exp(_initial_token) if _initial_token else 0,
 }
 
 def get_oauth_token():
