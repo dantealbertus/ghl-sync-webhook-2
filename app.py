@@ -34,6 +34,9 @@ COMPANY_ID  = os.environ["GHL_COMPANY_ID"]   # agency companyId
 NUM_TAG_RE = re.compile(r'^(\d{2})-(\d{2})\s+')
 FUZZY_THRESHOLD    = 75
 POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))  # default 5 min
+WEBHOOK_BASE_URL   = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+
+WEBHOOK_EVENTS = ["ContactCreate", "ContactUpdate", "ContactTagUpdate"]
 
 # Snapshot of last known company states for change detection
 # { company_id: {"contact_type": "...", "company_tags": ["key1", ...]} }
@@ -500,8 +503,53 @@ def poll_company_changes():
     log.info(f"Poll complete — {len(companies)} companies checked")
 
 
+def setup_webhooks():
+    """Register GHL contact webhooks programmatically — no GHL UI needed."""
+    if not WEBHOOK_BASE_URL:
+        log.warning("WEBHOOK_BASE_URL not set — skipping webhook registration")
+        return
+
+    target_url = f"{WEBHOOK_BASE_URL}/webhook/contact"
+
+    try:
+        # List existing webhooks for this location
+        resp = requests.get(
+            f"{BASE_URL}/webhooks/",
+            headers=oauth_headers(),
+            params={"locationId": LOCATION_ID},
+            timeout=15
+        )
+        existing = resp.json().get("webhooks", [])
+
+        # Don't re-register if our URL is already there
+        for wh in existing:
+            if wh.get("url") == target_url:
+                log.info(f"Webhook already registered: {target_url}")
+                return
+
+        # Register
+        r = requests.post(
+            f"{BASE_URL}/webhooks/",
+            headers=oauth_headers(),
+            json={
+                "locationId": LOCATION_ID,
+                "name":       "GHL Contact Sync",
+                "url":        target_url,
+                "events":     WEBHOOK_EVENTS,
+            },
+            timeout=15
+        )
+        if r.status_code in (200, 201):
+            log.info(f"Webhook registered: {target_url} events={WEBHOOK_EVENTS}")
+        else:
+            log.error(f"Webhook registration failed: {r.status_code} {r.text[:300]}")
+    except Exception as e:
+        log.error(f"setup_webhooks error: {e}")
+
+
 def _poll_loop():
     """Runs poll_company_changes on a fixed interval forever."""
+    setup_webhooks()  # register contact webhooks once on startup
     while True:
         try:
             poll_company_changes()
