@@ -35,6 +35,8 @@ NUM_TAG_RE         = re.compile(r'^(\d{2})-(\d{2})\s+')
 FUZZY_THRESHOLD    = 75
 POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 WEBHOOK_BASE_URL   = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
+REDIRECT_URI       = os.environ.get("GHL_REDIRECT_URI", "https://unbreakablesystems.nl/")
+GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write oauth.write oauth.readonly"
 WEBHOOK_NAME       = "GHL Contact Sync"
 WEBHOOK_EVENTS     = ["ContactCreate", "ContactUpdate", "ContactTagUpdate"]
 
@@ -67,9 +69,10 @@ def _jwt_exp(token: str) -> float:
 
 _initial_token = os.environ.get("GHL_LOCATION_TOKEN", "")
 _token_cache = {
-    "access_token":  _initial_token,
-    "refresh_token": os.environ.get("GHL_REFRESH_TOKEN", ""),
-    "expires_at":    _jwt_exp(_initial_token) if _initial_token else 0,
+    "access_token":         _initial_token,
+    "refresh_token":        os.environ.get("GHL_REFRESH_TOKEN", ""),       # location refresh (fallback)
+    "agency_refresh_token": os.environ.get("GHL_AGENCY_REFRESH_TOKEN", ""), # agency refresh (preferred)
+    "expires_at":           _jwt_exp(_initial_token) if _initial_token else 0,
 }
 
 def get_oauth_token() -> str:
@@ -79,10 +82,18 @@ def get_oauth_token() -> str:
         return _refresh_oauth_token()
 
 def _refresh_oauth_token() -> str:
-    """Must be called with _token_lock held."""
-    refresh_tok = _token_cache.get("refresh_token") or os.environ.get("GHL_REFRESH_TOKEN", "")
+    """Must be called with _token_lock held.
+    Uses agency_refresh_token if available (preferred), falls back to location refresh token.
+    """
+    # Prefer agency refresh token — it reliably works with /oauth/token
+    refresh_tok = (
+        _token_cache.get("agency_refresh_token")
+        or _token_cache.get("refresh_token")
+        or os.environ.get("GHL_AGENCY_REFRESH_TOKEN", "")
+        or os.environ.get("GHL_REFRESH_TOKEN", "")
+    )
     if not refresh_tok:
-        log.error("No refresh token available — update GHL_LOCATION_TOKEN via POST /reauth")
+        log.error("No refresh token — visit GET /oauth/url to re-authorize")
         return _token_cache["access_token"]
 
     resp = requests.post(
@@ -97,10 +108,14 @@ def _refresh_oauth_token() -> str:
         timeout=15
     )
     if resp.status_code not in (200, 201):
-        log.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]} — update via POST /reauth")
+        log.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]} — visit GET /oauth/url to re-authorize")
         return _token_cache["access_token"]
 
     agency_data = resp.json()
+    # Save new agency refresh token if returned
+    if agency_data.get("refresh_token"):
+        _token_cache["agency_refresh_token"] = agency_data["refresh_token"]
+
     loc_resp = requests.post(
         f"{BASE_URL}/oauth/locationToken",
         headers={"Authorization": f"Bearer {agency_data['access_token']}",
@@ -118,6 +133,46 @@ def _refresh_oauth_token() -> str:
     _token_cache["expires_at"]    = time.time() + loc_data.get("expires_in", 86400)
     log.info("OAuth token refreshed successfully")
     return _token_cache["access_token"]
+
+
+def _exchange_code(code: str) -> dict:
+    """Exchange an auth code for agency + location tokens. Saves agency_refresh_token."""
+    resp = requests.post(
+        f"{BASE_URL}/oauth/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type":    "authorization_code",
+            "code":          code,
+            "redirect_uri":  REDIRECT_URI,
+        },
+        timeout=15
+    )
+    if resp.status_code not in (200, 201):
+        return {"error": f"Code exchange failed: {resp.status_code} {resp.text[:200]}"}
+
+    agency_data = resp.json()
+
+    loc_resp = requests.post(
+        f"{BASE_URL}/oauth/locationToken",
+        headers={"Authorization": f"Bearer {agency_data['access_token']}",
+                 "Version": "2021-07-28", "Content-Type": "application/json"},
+        json={"companyId": COMPANY_ID, "locationId": LOCATION_ID},
+        timeout=15
+    )
+    if loc_resp.status_code not in (200, 201):
+        return {"error": f"Location token failed: {loc_resp.status_code} {loc_resp.text[:200]}"}
+
+    loc_data = loc_resp.json()
+    with _token_lock:
+        _token_cache["access_token"]         = loc_data["access_token"]
+        _token_cache["refresh_token"]        = loc_data.get("refresh_token", "")
+        _token_cache["agency_refresh_token"] = agency_data.get("refresh_token", "")
+        _token_cache["expires_at"]           = time.time() + loc_data.get("expires_in", 86400)
+
+    log.info("OAuth exchange complete — agency_refresh_token saved, auto-refresh enabled")
+    return {"status": "ok", "expires_at": _token_cache["expires_at"]}
 
 def pit_headers() -> dict:
     return {"Authorization": f"Bearer {PIT_TOKEN}", "Version": "2021-07-28", "Content-Type": "application/json"}
@@ -441,6 +496,39 @@ def reauth():
     exp = _token_cache["expires_at"]
     log.info(f"Token updated via /reauth — expires {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}")
     return jsonify({"status": "ok", "expires_at": exp}), 200
+
+
+@app.route("/oauth/url", methods=["GET"])
+def oauth_url():
+    """Return the GHL authorization URL. Visit it in your browser, then POST the code to /oauth/exchange."""
+    from urllib.parse import urlencode
+    url = "https://marketplace.gohighlevel.com/oauth/chooselocation?" + urlencode({
+        "response_type": "code",
+        "redirect_uri":  REDIRECT_URI,
+        "client_id":     CLIENT_ID,
+        "scope":         GHL_SCOPES,
+    })
+    return jsonify({"url": url, "redirect_uri": REDIRECT_URI}), 200
+
+
+@app.route("/oauth/exchange", methods=["POST"])
+def oauth_exchange():
+    """Exchange an auth code for tokens.
+
+    After visiting the URL from /oauth/url and authorizing, GHL redirects to
+    REDIRECT_URI?code=<code>. Copy that code and POST it here:
+
+    POST /oauth/exchange
+    { "code": "abc123..." }
+    """
+    data = request.json or {}
+    code = data.get("code", "").strip()
+    if not code:
+        return jsonify({"error": "code required"}), 400
+    result = _exchange_code(code)
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result), 200
 
 
 @app.route("/sync/contact/<contact_id>", methods=["POST"])
