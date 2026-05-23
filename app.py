@@ -438,6 +438,12 @@ def sync_company_to_contacts(company_id: str, contact_type=None, company_tags_ad
 @app.route("/webhook/contact", methods=["POST"])
 def contact_webhook():
     data       = request.json or {}
+    event_type = (data.get("type") or "").lower()
+
+    # Marketplace app sends all events to this URL — route non-contact events correctly
+    if any(k in event_type for k in ["record", "object"]):
+        return record_webhook()
+
     contact_id = data.get("id") or data.get("contactId") or data.get("contact", {}).get("id")
     log.info(f"Contact webhook: type={data.get('type')} id={contact_id}")
 
