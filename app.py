@@ -568,6 +568,13 @@ def force_sync_company(company_id):
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/setup-webhooks", methods=["POST"])
+def trigger_setup_webhooks():
+    """Re-run webhook registration (useful if setup failed at startup due to bad token)."""
+    setup_webhooks()
+    return jsonify({"status": "done"}), 200
+
+
 @app.route("/sync-all", methods=["POST"])
 def force_sync_all():
     """Force-sync all companies → their linked contacts (bypasses snapshot/debounce).
