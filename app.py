@@ -37,7 +37,7 @@ POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 WEBHOOK_BASE_URL   = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
 REDIRECT_URI       = os.environ.get("GHL_REDIRECT_URI",
                         f"{WEBHOOK_BASE_URL}/oauth/callback" if WEBHOOK_BASE_URL else "https://unbreakablesystems.nl/")
-GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write"
+GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write contacts.readonly contacts.write"
 GHL_APP_VERSION_ID = CLIENT_ID.split("-")[0]   # base ID without the key suffix
 WEBHOOK_NAME       = "GHL Contact Sync"
 WEBHOOK_EVENTS     = ["ContactCreate", "ContactUpdate", "ContactTagUpdate"]
