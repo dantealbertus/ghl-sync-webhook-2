@@ -457,12 +457,81 @@ def company_webhook():
 def generic_webhook():
     data       = request.json or {}
     event_type = data.get("type", "").lower()
-    log.info(f"Webhook: type={event_type}")
-    if any(k in event_type for k in ["contact", "tag"]):
+    log.info(f"Webhook: type={event_type} id={data.get('id') or data.get('objectId') or data.get('recordId')}")
+
+    if any(k in event_type for k in ["contact", "contacttag"]):
         return contact_webhook()
-    if any(k in event_type for k in ["company", "business", "object"]):
+
+    # RecordUpdate/RecordCreate from Marketplace app webhooks — filter for business records
+    if any(k in event_type for k in ["record", "object"]):
+        return record_webhook()
+
+    if any(k in event_type for k in ["company", "business"]):
         return company_webhook()
+
     return jsonify({"status": "ignored", "type": event_type}), 200
+
+
+@app.route("/webhook/record", methods=["POST"])
+def record_webhook():
+    """Handles RecordUpdate/RecordCreate from Marketplace app webhooks.
+    Filters for business (company) records and syncs to linked contacts.
+    """
+    data = request.json or {}
+    log.info(f"Record webhook: {json.dumps(data)[:300]}")
+
+    # GHL sends objectType or similar to identify the record type
+    obj_type  = (data.get("objectType") or data.get("type") or "").lower()
+    record_id = data.get("id") or data.get("objectId") or data.get("recordId")
+
+    # Only process business/company records
+    if obj_type and "business" not in obj_type and "company" not in obj_type and "record" not in obj_type:
+        return jsonify({"status": "ignored", "objectType": obj_type}), 200
+
+    if not record_id:
+        return jsonify({"status": "no record_id"}), 200
+
+    # Fetch current company state and sync to contacts
+    try:
+        resp = _ghl_request(lambda: requests.post(
+            f"{BASE_URL}/objects/business/records/search",
+            headers=oauth_headers(),
+            json={"locationId": LOCATION_ID, "filters": [{"field": "id", "operator": "eq", "value": record_id}]},
+            timeout=15
+        ))
+        records = resp.json().get("records", [])
+        if not records:
+            log.warning(f"Record {record_id} not found as business record — skipping")
+            return jsonify({"status": "not_a_business_record"}), 200
+
+        comp  = records[0]
+        props = comp.get("properties", {})
+        ct    = props.get("contact_type") or ""
+        tags  = sorted(props.get("company_tags") or [])
+
+        # Compare with snapshot to determine what changed
+        with _snapshot_lock:
+            prev = _company_snapshot.get(record_id, {})
+
+        prev_ct   = prev.get("contact_type", "")
+        prev_tags = prev.get("company_tags", [])
+        ct_changed   = ct != prev_ct
+        tags_added   = [t for t in tags if t not in prev_tags]
+        tags_removed = [t for t in prev_tags if t not in tags]
+
+        if ct_changed or tags_added or tags_removed:
+            sync_company_to_contacts(record_id,
+                contact_type=ct if ct_changed else None,
+                company_tags_added=tags_added or None,
+                company_tags_removed=tags_removed or None)
+
+        with _snapshot_lock:
+            _company_snapshot[record_id] = {"contact_type": ct, "company_tags": tags}
+
+    except Exception as e:
+        log.error(f"record_webhook error: {e}")
+
+    return jsonify({"status": "ok"}), 200
 
 
 @app.route("/health", methods=["GET"])
