@@ -206,7 +206,13 @@ def update_contact(contact_id, payload):
 
 # ── Sync logic ────────────────────────────────────────────────────────────────
 def sync_contact_to_company(contact):
-    """Derive company fields from contact and update the linked company."""
+    """
+    Derive company fields from a contact and update the linked company.
+
+    Contact → Company:
+      contact.type       → company.contact_type  (single select "Contact Type")
+      contact.tags       → company.company_tags  (multi-select "Company Tags", add/remove)
+    """
     company_id = contact.get("businessId")
     if not company_id:
         return
@@ -217,46 +223,48 @@ def sync_contact_to_company(contact):
 
     mark_syncing(f"contact_{contact['id']}")
 
-    tags = contact.get("tags", [])
+    tags     = contact.get("tags", [])
     raw_type = (contact.get("type") or "").strip()
 
-    # contact_type (single value)
+    # contact_type (single select "Contact Type")
     ct_key = resolve_contact_type(raw_type)
 
-    # company_tag: lowest numeric tag (single select)
-    best_code, best_key = None, None
-    tag_by_code, _ = get_field_options()
-    for tag in tags:
-        m = NUM_TAG_RE.match(tag.strip())
-        if m:
-            code = m.group(1) + m.group(2)
-            if code in tag_by_code and (best_code is None or code < best_code):
-                best_code, best_key = code, tag_by_code[code]
-
-    # company_tags: all tags (multi-select)
-    tag_keys = [k for k in (resolve_tag_key(t) for t in tags) if k]
+    # company_tags: map ALL contact tags → option keys (multi-select "Company Tags")
+    tag_keys_to_add = [k for k in (resolve_tag_key(t) for t in tags) if k]
+    unresolved = [t for t in tags if not resolve_tag_key(t)]
+    if unresolved:
+        log.warning(f"Unresolved tags (not in dropdown): {unresolved}")
 
     props = {}
     if ct_key:
         props["contact_type"] = ct_key
-    if best_key:
-        props["company_tag"] = best_key
-    if tag_keys:
-        props["company_tags"] = {"add": tag_keys}
+    if tag_keys_to_add:
+        # add: adds keys, does not remove existing ones already on the company
+        props["company_tags"] = {"add": tag_keys_to_add}
 
     if props:
-        log.info(f"Syncing contact {contact['id']} → company {company_id}: {props}")
+        log.info(f"Contact {contact['id']} → company {company_id}: contact_type={ct_key}, company_tags add={tag_keys_to_add}")
         update_company(company_id, props)
 
 
-def sync_company_to_contacts(company_id, contact_type=None, company_tag=None):
-    """Push company field changes to all linked contacts."""
+def sync_company_to_contacts(company_id, contact_type=None, company_tags_added=None, company_tags_removed=None):
+    """
+    Push company field changes to all linked contacts.
+
+    Company → Contact:
+      company.contact_type  → contact.type
+      company.company_tags  → contact.tags (add/remove matching tag labels)
+    """
     if is_syncing(f"company_{company_id}"):
         return
 
     mark_syncing(f"company_{company_id}")
     linked = get_linked_contacts(company_id)
-    log.info(f"Syncing company {company_id} → {len(linked)} contacts")
+    log.info(f"Company {company_id} → {len(linked)} contacts: contact_type={contact_type}, tags_add={company_tags_added}, tags_remove={company_tags_removed}")
+
+    # Build reverse lookup: option key → tag label (e.g. "0202_makelaartaxateur" → "02-02 makelaar/taxateur")
+    _, tag_by_label = get_field_options()
+    key_to_label = {v: k for k, v in tag_by_label.items()}
 
     for contact in linked:
         if is_syncing(f"contact_{contact['id']}"):
@@ -264,25 +272,25 @@ def sync_company_to_contacts(company_id, contact_type=None, company_tag=None):
 
         payload = {}
 
-        # contact_type → contact.type
+        # Sync contact_type → contact.type
         if contact_type:
-            # Map company key back to contact type value
             reverse_map = {v: k for k, v in CONTACT_TYPE_MAP.items()}
-            contact_type_val = reverse_map.get(contact_type, contact_type)
-            payload["type"] = contact_type_val
+            payload["type"] = reverse_map.get(contact_type, contact_type)
 
-        # company_tag → add corresponding tag on contact
-        if company_tag:
-            tag_by_code, _ = get_field_options()
-            # Find label for this key
-            tag_label = next(
-                (opt_label for opt_label, key in _field_cache["tag_by_label"].items() if key == company_tag),
-                None
-            )
-            if tag_label:
-                existing_tags = contact.get("tags", [])
-                if tag_label not in existing_tags:
-                    payload["tags"] = existing_tags + [tag_label]
+        # Sync company_tags changes → contact.tags (add/remove)
+        if company_tags_added or company_tags_removed:
+            existing = set(contact.get("tags", []))
+            if company_tags_added:
+                for key in company_tags_added:
+                    label = key_to_label.get(key)
+                    if label:
+                        existing.add(label)
+            if company_tags_removed:
+                for key in company_tags_removed:
+                    label = key_to_label.get(key)
+                    if label and label in existing:
+                        existing.discard(label)
+            payload["tags"] = list(existing)
 
         if payload:
             mark_syncing(f"contact_{contact['id']}")
@@ -317,21 +325,42 @@ def contact_webhook():
 @app.route("/webhook/company", methods=["POST"])
 def company_webhook():
     """
-    Receives company update webhooks.
-    Can be called from a GHL Workflow (Custom Webhook action) when a company is updated.
-    Expected payload: {"companyId": "...", "contact_type": "...", "company_tag": "..."}
+    Receives company update webhooks (via GHL Workflow → Custom Webhook action).
+
+    Expected payload from GHL Workflow:
+    {
+      "companyId":          "{{contact.businessId}}",
+      "contact_type":       "{{company.contact_type}}",
+      "company_tags_added":   ["key1", "key2"],   // optional: keys that were added
+      "company_tags_removed": ["key3"]             // optional: keys that were removed
+    }
+
+    Or pass full company_tags list and we sync everything:
+    {
+      "companyId":      "...",
+      "contact_type":   "...",
+      "company_tags":   ["key1", "key2", "key3"]
+    }
     """
     data = request.json or {}
     log.info(f"Company webhook: {data}")
 
     company_id   = data.get("companyId") or data.get("id") or data.get("objectId")
     contact_type = data.get("contact_type") or data.get("contactType")
-    company_tag  = data.get("company_tag") or data.get("companyTag")
+
+    # Support both delta (added/removed) and full list
+    tags_added   = data.get("company_tags_added", [])
+    tags_removed = data.get("company_tags_removed", [])
+    if not tags_added and not tags_removed and data.get("company_tags"):
+        tags_added = data.get("company_tags")  # treat full list as "add all"
 
     if not company_id:
         return jsonify({"status": "no company_id"}), 200
 
-    sync_company_to_contacts(company_id, contact_type=contact_type, company_tag=company_tag)
+    sync_company_to_contacts(company_id,
+        contact_type=contact_type,
+        company_tags_added=tags_added,
+        company_tags_removed=tags_removed)
     return jsonify({"status": "ok"}), 200
 
 
@@ -377,7 +406,8 @@ def force_sync_company(company_id):
     body = request.json or {}
     sync_company_to_contacts(company_id,
         contact_type=body.get("contact_type"),
-        company_tag=body.get("company_tag"))
+        company_tags_added=body.get("company_tags_added") or body.get("company_tags"),
+        company_tags_removed=body.get("company_tags_removed"))
     return jsonify({"status": "ok"}), 200
 
 
