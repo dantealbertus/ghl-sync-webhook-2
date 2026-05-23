@@ -35,7 +35,8 @@ NUM_TAG_RE         = re.compile(r'^(\d{2})-(\d{2})\s+')
 FUZZY_THRESHOLD    = 75
 POLL_INTERVAL_SECS = int(os.environ.get("POLL_INTERVAL_SECONDS", "300"))
 WEBHOOK_BASE_URL   = os.environ.get("WEBHOOK_BASE_URL", "").rstrip("/")
-REDIRECT_URI       = os.environ.get("GHL_REDIRECT_URI", "https://unbreakablesystems.nl/")
+REDIRECT_URI       = os.environ.get("GHL_REDIRECT_URI",
+                        f"{WEBHOOK_BASE_URL}/oauth/callback" if WEBHOOK_BASE_URL else "https://unbreakablesystems.nl/")
 GHL_SCOPES         = "objects/schema.readonly objects/schema.write objects/record.readonly objects/record.write oauth.write oauth.readonly"
 WEBHOOK_NAME       = "GHL Contact Sync"
 WEBHOOK_EVENTS     = ["ContactCreate", "ContactUpdate", "ContactTagUpdate"]
@@ -509,6 +510,21 @@ def oauth_url():
         "scope":         GHL_SCOPES,
     })
     return jsonify({"url": url, "redirect_uri": REDIRECT_URI}), 200
+
+
+@app.route("/oauth/callback", methods=["GET"])
+def oauth_callback():
+    """GHL redirects here with ?code=... after user authorizes. Exchanges automatically."""
+    code  = request.args.get("code", "").strip()
+    error = request.args.get("error")
+    if error:
+        return f"<h2>OAuth error: {error}</h2>", 400
+    if not code:
+        return "<h2>No code received</h2>", 400
+    result = _exchange_code(code)
+    if "error" in result:
+        return f"<h2>Exchange failed</h2><pre>{result['error']}</pre>", 400
+    return "<h2>✅ Authorized!</h2><p>Tokens saved. Auto-refresh is now active. You can close this tab.</p>", 200
 
 
 @app.route("/oauth/exchange", methods=["POST"])
