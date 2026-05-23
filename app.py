@@ -692,6 +692,9 @@ def setup_webhooks():
             params={"locationId": LOCATION_ID},
             timeout=15
         ))
+        if not resp.text.strip():
+            log.warning("Webhooks API returned empty response — configure webhooks manually in GHL Marketplace app")
+            return
         existing = resp.json().get("webhooks", [])
 
         already_registered = False
