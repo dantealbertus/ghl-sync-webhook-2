@@ -868,6 +868,7 @@ def _fetch_all_contacts_lightweight() -> list:
 
 def poll_contact_type_changes():
     """Detect contact type changes (GHL doesn't send webhooks for type changes)."""
+    log.info("Polling contacts for type changes...")
     try:
         contacts = _fetch_all_contacts_lightweight()
     except Exception as e:
@@ -896,8 +897,7 @@ def poll_contact_type_changes():
         with _snapshot_lock:
             _contact_type_snapshot[cid] = cur_type
 
-    if changed:
-        log.info(f"Contact type poll: {changed} changes synced")
+    log.info(f"Contact type poll complete — {len(contacts)} contacts checked, {changed} changes synced")
 
 
 def _poll_loop():
