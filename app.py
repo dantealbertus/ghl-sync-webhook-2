@@ -129,7 +129,6 @@ def _refresh_oauth_token() -> str:
     """Must be called with _token_lock held.
     Uses agency_refresh_token if available (preferred), falls back to location refresh token.
     """
-    # Prefer agency refresh token — it reliably works with /oauth/token
     refresh_tok = _token_cache.get("agency_refresh_token") or _token_cache.get("refresh_token")
     if not refresh_tok:
         log.error("No refresh token — visit GET /oauth/url to re-authorize")
@@ -157,35 +156,50 @@ def _refresh_oauth_token() -> str:
             log.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]}")
         return _token_cache["access_token"]
 
-    agency_data = resp.json()
-    # The old refresh token is now dead — persist the new one before anything else can fail
-    if agency_data.get("refresh_token"):
-        _token_cache["agency_refresh_token"] = agency_data["refresh_token"]
-        _save_token_store()
-
-    loc_resp = requests.post(
-        f"{BASE_URL}/oauth/locationToken",
-        headers={"Authorization": f"Bearer {agency_data['access_token']}",
-                 "Version": "2021-07-28", "Content-Type": "application/json"},
-        json={"companyId": COMPANY_ID, "locationId": LOCATION_ID},
-        timeout=15
-    )
-    if loc_resp.status_code not in (200, 201):
-        log.error(f"Location token failed: {loc_resp.status_code}")
-        return _token_cache["access_token"]
-
-    loc_data = loc_resp.json()
-    _token_cache["access_token"]  = loc_data["access_token"]
-    _token_cache["refresh_token"] = loc_data.get("refresh_token", _token_cache["refresh_token"])
-    _token_cache["expires_at"]    = time.time() + loc_data.get("expires_in", 86400)
-    _token_cache["needs_reauth_since"] = 0
-    _save_token_store()
-    log.info("OAuth token refreshed successfully")
+    error = _store_token_response(resp.json())
+    if error:
+        log.error(error)
+    else:
+        log.info("OAuth token refreshed successfully")
     return _token_cache["access_token"]
 
 
+def _store_token_response(data: dict):
+    """Must be called with _token_lock held. Returns an error string, or None on success.
+
+    A sub-account install yields a Location token that can be used directly. An agency install
+    yields a Company token that first has to be exchanged for a location token.
+    """
+    if data.get("userType") == "Location" or data.get("locationId"):
+        if data.get("locationId") and data["locationId"] != LOCATION_ID:
+            return f"Authorized location {data['locationId']} does not match GHL_LOCATION_ID {LOCATION_ID}"
+        loc_data = data
+        _token_cache["agency_refresh_token"] = ""
+    else:
+        # The old refresh token is now dead — persist the new one before anything else can fail
+        _token_cache["agency_refresh_token"] = data.get("refresh_token", "")
+        _save_token_store()
+        loc_resp = requests.post(
+            f"{BASE_URL}/oauth/locationToken",
+            headers={"Authorization": f"Bearer {data['access_token']}",
+                     "Version": "2021-07-28", "Content-Type": "application/json"},
+            json={"companyId": COMPANY_ID, "locationId": LOCATION_ID},
+            timeout=15
+        )
+        if loc_resp.status_code not in (200, 201):
+            return f"Location token failed: {loc_resp.status_code} {loc_resp.text[:200]}"
+        loc_data = loc_resp.json()
+
+    _token_cache["access_token"]       = loc_data["access_token"]
+    _token_cache["refresh_token"]      = loc_data.get("refresh_token") or _token_cache["refresh_token"]
+    _token_cache["expires_at"]         = time.time() + loc_data.get("expires_in", 86400)
+    _token_cache["needs_reauth_since"] = 0
+    _save_token_store()
+    return None
+
+
 def _exchange_code(code: str) -> dict:
-    """Exchange an auth code for agency + location tokens. Saves agency_refresh_token."""
+    """Exchange an auth code for tokens (agency or sub-account install) and persist them."""
     resp = requests.post(
         f"{BASE_URL}/oauth/token",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -201,28 +215,12 @@ def _exchange_code(code: str) -> dict:
     if resp.status_code not in (200, 201):
         return {"error": f"Code exchange failed: {resp.status_code} {resp.text[:200]}"}
 
-    agency_data = resp.json()
-
-    loc_resp = requests.post(
-        f"{BASE_URL}/oauth/locationToken",
-        headers={"Authorization": f"Bearer {agency_data['access_token']}",
-                 "Version": "2021-07-28", "Content-Type": "application/json"},
-        json={"companyId": COMPANY_ID, "locationId": LOCATION_ID},
-        timeout=15
-    )
-    if loc_resp.status_code not in (200, 201):
-        return {"error": f"Location token failed: {loc_resp.status_code} {loc_resp.text[:200]}"}
-
-    loc_data = loc_resp.json()
     with _token_lock:
-        _token_cache["access_token"]         = loc_data["access_token"]
-        _token_cache["refresh_token"]        = loc_data.get("refresh_token", "")
-        _token_cache["agency_refresh_token"] = agency_data.get("refresh_token", "")
-        _token_cache["expires_at"]           = time.time() + loc_data.get("expires_in", 86400)
-        _token_cache["needs_reauth_since"]   = 0
-        _save_token_store()
+        error = _store_token_response(resp.json())
+    if error:
+        return {"error": error}
 
-    log.info("OAuth exchange complete — agency_refresh_token saved, auto-refresh enabled")
+    log.info("OAuth exchange complete — tokens saved, auto-refresh enabled")
     return {"status": "ok", "expires_at": _token_cache["expires_at"]}
 
 def pit_headers() -> dict:
