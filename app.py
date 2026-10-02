@@ -990,6 +990,10 @@ def start_poller():
 # Start background poller when module is imported (works with gunicorn)
 start_poller()
 
+# Standalone contact↔opportunity source sync (independent of the sync above)
+import source_sync
+source_sync.start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log.info(f"Starting GHL sync server on port {port}")
