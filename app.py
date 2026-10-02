@@ -69,17 +69,59 @@ def _jwt_exp(token: str) -> float:
     except Exception:
         return 0.0
 
+# GHL refresh tokens are single-use: every refresh invalidates the old one. Tokens therefore
+# live in a JSON file on a persistent volume — env vars only seed the very first boot, otherwise
+# every redeploy would restart from an already-consumed refresh token.
+TOKEN_STORE_PATH = os.environ.get(
+    "TOKEN_STORE_PATH",
+    "/data/ghl_tokens.json" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ghl_tokens.json"),
+)
+_TOKEN_KEYS = ("access_token", "refresh_token", "agency_refresh_token", "expires_at")
+REAUTH_RETRY_SECS = 3600   # after a rejected refresh token, only retry once per hour
+
+def _load_token_store() -> dict:
+    try:
+        with open(TOKEN_STORE_PATH) as f:
+            stored = json.load(f)
+        log.info(f"Loaded OAuth tokens from {TOKEN_STORE_PATH}")
+        return {k: stored[k] for k in _TOKEN_KEYS if k in stored}
+    except FileNotFoundError:
+        log.warning(f"No token store at {TOKEN_STORE_PATH} — seeding from env vars")
+    except Exception as e:
+        log.error(f"Could not read token store {TOKEN_STORE_PATH}: {e} — seeding from env vars")
+    return {}
+
+def _save_token_store():
+    """Must be called with _token_lock held. Atomic write so a crash never leaves half a file."""
+    tmp = TOKEN_STORE_PATH + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(TOKEN_STORE_PATH), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump({k: _token_cache[k] for k in _TOKEN_KEYS}, f)
+        os.replace(tmp, TOKEN_STORE_PATH)
+    except Exception as e:
+        log.error(f"Could not persist OAuth tokens to {TOKEN_STORE_PATH}: {e} — next restart will need re-authorization")
+
 _initial_token = os.environ.get("GHL_LOCATION_TOKEN", "")
 _token_cache = {
     "access_token":         _initial_token,
     "refresh_token":        os.environ.get("GHL_REFRESH_TOKEN", ""),       # location refresh (fallback)
     "agency_refresh_token": os.environ.get("GHL_AGENCY_REFRESH_TOKEN", ""), # agency refresh (preferred)
     "expires_at":           _jwt_exp(_initial_token) if _initial_token else 0,
+    "needs_reauth_since":   0,   # set when GHL rejects the refresh token; cleared on new tokens
 }
+_token_cache.update(_load_token_store())
+
+def needs_reauth() -> bool:
+    with _token_lock:
+        return bool(_token_cache["needs_reauth_since"])
 
 def get_oauth_token() -> str:
     with _token_lock:
         if time.time() < _token_cache["expires_at"] - 300:
+            return _token_cache["access_token"]
+        since = _token_cache["needs_reauth_since"]
+        if since and time.time() - since < REAUTH_RETRY_SECS:
             return _token_cache["access_token"]
         return _refresh_oauth_token()
 
@@ -88,14 +130,10 @@ def _refresh_oauth_token() -> str:
     Uses agency_refresh_token if available (preferred), falls back to location refresh token.
     """
     # Prefer agency refresh token — it reliably works with /oauth/token
-    refresh_tok = (
-        _token_cache.get("agency_refresh_token")
-        or _token_cache.get("refresh_token")
-        or os.environ.get("GHL_AGENCY_REFRESH_TOKEN", "")
-        or os.environ.get("GHL_REFRESH_TOKEN", "")
-    )
+    refresh_tok = _token_cache.get("agency_refresh_token") or _token_cache.get("refresh_token")
     if not refresh_tok:
         log.error("No refresh token — visit GET /oauth/url to re-authorize")
+        _token_cache["needs_reauth_since"] = time.time()
         return _token_cache["access_token"]
 
     resp = requests.post(
@@ -110,13 +148,20 @@ def _refresh_oauth_token() -> str:
         timeout=15
     )
     if resp.status_code not in (200, 201):
-        log.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]} — visit GET /oauth/url to re-authorize")
+        if resp.status_code in (400, 401):
+            # Refresh token is consumed/revoked — retrying won't help until someone re-authorizes
+            _token_cache["needs_reauth_since"] = time.time()
+            log.error(f"Token refresh rejected: {resp.status_code} {resp.text[:200]} — visit GET /oauth/url to re-authorize "
+                      f"(OAuth calls paused, next retry in {REAUTH_RETRY_SECS // 60} min)")
+        else:
+            log.error(f"Token refresh failed: {resp.status_code} {resp.text[:200]}")
         return _token_cache["access_token"]
 
     agency_data = resp.json()
-    # Save new agency refresh token if returned
+    # The old refresh token is now dead — persist the new one before anything else can fail
     if agency_data.get("refresh_token"):
         _token_cache["agency_refresh_token"] = agency_data["refresh_token"]
+        _save_token_store()
 
     loc_resp = requests.post(
         f"{BASE_URL}/oauth/locationToken",
@@ -133,6 +178,8 @@ def _refresh_oauth_token() -> str:
     _token_cache["access_token"]  = loc_data["access_token"]
     _token_cache["refresh_token"] = loc_data.get("refresh_token", _token_cache["refresh_token"])
     _token_cache["expires_at"]    = time.time() + loc_data.get("expires_in", 86400)
+    _token_cache["needs_reauth_since"] = 0
+    _save_token_store()
     log.info("OAuth token refreshed successfully")
     return _token_cache["access_token"]
 
@@ -172,6 +219,8 @@ def _exchange_code(code: str) -> dict:
         _token_cache["refresh_token"]        = loc_data.get("refresh_token", "")
         _token_cache["agency_refresh_token"] = agency_data.get("refresh_token", "")
         _token_cache["expires_at"]           = time.time() + loc_data.get("expires_in", 86400)
+        _token_cache["needs_reauth_since"]   = 0
+        _save_token_store()
 
     log.info("OAuth exchange complete — agency_refresh_token saved, auto-refresh enabled")
     return {"status": "ok", "expires_at": _token_cache["expires_at"]}
@@ -568,12 +617,15 @@ def record_webhook():
 def health():
     with _token_lock:
         token_exp = _token_cache["expires_at"]
+        reauth    = bool(_token_cache["needs_reauth_since"])
     hours_left = max(0, (token_exp - time.time()) / 3600)
     return jsonify({
         "status":           "ok",
         "location":         LOCATION_ID,
         "token_expires_in": f"{hours_left:.1f}h",
-        "token_ok":         hours_left > 0,
+        "token_ok":         hours_left > 0 and not reauth,
+        "needs_reauth":     reauth,
+        "token_store":      TOKEN_STORE_PATH,
     }), 200
 
 
@@ -594,6 +646,8 @@ def reauth():
         _token_cache["expires_at"]   = _jwt_exp(token)
         if refresh:
             _token_cache["refresh_token"] = refresh
+        _token_cache["needs_reauth_since"] = 0
+        _save_token_store()
     exp = _token_cache["expires_at"]
     log.info(f"Token updated via /reauth — expires {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}")
     return jsonify({"status": "ok", "expires_at": exp}), 200
@@ -702,6 +756,7 @@ def force_sync_all():
 
 # ── Background company poller ─────────────────────────────────────────────────
 _company_snapshot: dict = {}
+_reauth_warned_at = 0.0
 
 
 def _fetch_all_companies() -> list:
@@ -729,6 +784,13 @@ def _fetch_all_companies() -> list:
 
 
 def poll_company_changes():
+    global _reauth_warned_at
+    oauth_headers()   # refresh up front so a dead token is detected before fetching
+    if needs_reauth():
+        if time.time() - _reauth_warned_at >= REAUTH_RETRY_SECS:
+            log.warning("Company polls paused — OAuth needs re-authorization via GET /oauth/url")
+            _reauth_warned_at = time.time()
+        return
     log.info("Polling companies for changes...")
     try:
         companies = _fetch_all_companies()
